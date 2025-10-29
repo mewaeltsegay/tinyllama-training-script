@@ -337,3 +337,5 @@ performance_results/
 # Temporary test files
 test_output/
 temp_datasets/
+
+.gitignore
