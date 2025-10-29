@@ -193,7 +193,12 @@ class InferenceEngine:
         results = {}
         
         for prompt in prompts:
-            logger.info(f"Generating {samples_per_prompt} samples for prompt: {prompt}")
+            # Safe logging without Unicode characters that might cause encoding issues
+            try:
+                logger.info(f"Generating {samples_per_prompt} samples for prompt: {prompt}")
+            except UnicodeEncodeError:
+                logger.info(f"Generating {samples_per_prompt} samples for prompt: [Tigrinya text]")
+            
             samples = []
             
             for i in range(samples_per_prompt):
@@ -207,7 +212,10 @@ class InferenceEngine:
                     logger.debug(f"Sample {i+1}/{samples_per_prompt} generated")
                     
                 except Exception as e:
-                    logger.warning(f"Failed to generate sample {i+1} for prompt '{prompt}': {str(e)}")
+                    try:
+                        logger.warning(f"Failed to generate sample {i+1} for prompt '{prompt}': {str(e)}")
+                    except UnicodeEncodeError:
+                        logger.warning(f"Failed to generate sample {i+1} for prompt [Tigrinya text]: {str(e)}")
                     samples.append(f"[Generation failed: {str(e)}]")
             
             results[prompt] = samples

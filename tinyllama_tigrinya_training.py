@@ -16,21 +16,63 @@ import traceback
 from pathlib import Path
 from typing import Optional, Any
 
+# Fix console encoding for Windows
+import os
+if os.name == 'nt':  # Windows
+    try:
+        import codecs
+        # Try to reconfigure stdout/stderr for UTF-8
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        else:
+            # Fallback for older Python versions
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach(), errors='replace')
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach(), errors='replace')
+    except Exception:
+        # If encoding fix fails, continue without it
+        pass
+
 import torch
 
 from config.training_config import TrainingConfig
 
 
 def setup_logging(log_level: str = "INFO") -> None:
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('training.log')
-        ]
+    """Set up logging configuration with Unicode support."""
+    import sys
+    import io
+    
+    # Configure stdout to handle Unicode properly
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    
+    # Create handlers with proper encoding
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, log_level.upper()))
+    
+    file_handler = logging.FileHandler('training.log', encoding='utf-8', errors='replace')
+    file_handler.setLevel(getattr(logging, log_level.upper()))
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
+    
+    console_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level.upper()))
+    
+    # Clear existing handlers
+    root_logger.handlers.clear()
+    
+    # Add our handlers
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
 
 
 def parse_arguments() -> TrainingConfig:
@@ -402,7 +444,7 @@ def main() -> None:
             if not dataset_files:
                 raise FileNotFoundError(f"No JSONL dataset files found in {config.dataset_dir}")
             
-            logger.info(f"✓ Validation completed: {len(dataset_files)} dataset files found")
+            logger.info(f"[OK] Validation completed: {len(dataset_files)} dataset files found")
         
         # ============================================================================
         # PHASE 2: HARDWARE DETECTION AND GPU OPTIMIZATION
@@ -418,16 +460,16 @@ def main() -> None:
             
             # Detect GPU configuration
             hardware_config = hardware_detector.detect_gpu_config()
-            logger.info(f"✓ Hardware configuration: {hardware_config}")
+            logger.info(f"[OK] Hardware configuration: {hardware_config}")
             
             # Override config with hardware-optimized settings if not explicitly set
             if config.batch_size is None:
                 config.batch_size = hardware_config["batch_size"]
-                logger.info(f"✓ Auto-configured batch size: {config.batch_size}")
+                logger.info(f"[OK] Auto-configured batch size: {config.batch_size}")
             
             if config.gradient_accumulation_steps is None:
                 config.gradient_accumulation_steps = hardware_config["gradient_accumulation_steps"]
-                logger.info(f"✓ Auto-configured gradient accumulation steps: {config.gradient_accumulation_steps}")
+                logger.info(f"[OK] Auto-configured gradient accumulation steps: {config.gradient_accumulation_steps}")
         
         # ============================================================================
         # PHASE 3: DATASET LOADING AND PREPROCESSING
@@ -461,14 +503,14 @@ def main() -> None:
             
             # Load and preprocess datasets
             datasets = dataset_loader.load_datasets()
-            logger.info(f"✓ Loaded datasets: {list(datasets.keys())}")
+            logger.info(f"[OK] Loaded datasets: {list(datasets.keys())}")
             
             for split, dataset in datasets.items():
                 logger.info(f"  {split}: {len(dataset)} examples")
             
             # Create data collator
             data_collator = dataset_loader.create_data_collator(mlm=False)
-            logger.info("✓ Data collator created for causal language modeling")
+            logger.info("[OK] Data collator created for causal language modeling")
         
         # ============================================================================
         # PHASE 4: MODEL MANAGEMENT AND TOKENIZER INTEGRATION
@@ -487,11 +529,11 @@ def main() -> None:
             
             # Load model and tokenizer
             model, tokenizer = model_manager.load_model_and_tokenizer()
-            logger.info("✓ Model and tokenizer loaded successfully")
+            logger.info("[OK] Model and tokenizer loaded successfully")
             
             # Log model information
             model_info = model_manager.get_model_info()
-            logger.info(f"✓ Model info: {model_info}")
+            logger.info(f"[OK] Model info: {model_info}")
         
         # ============================================================================
         # PHASE 5: TRAINING EXECUTION WITH MONITORING
@@ -516,15 +558,15 @@ def main() -> None:
             training_args = training_engine.setup_training_arguments()
             trainer = training_engine.create_trainer()
             
-            logger.info("✓ Training engine initialized")
-            logger.info(f"✓ Training configuration: {training_engine.get_training_status()}")
+            logger.info("[OK] Training engine initialized")
+            logger.info(f"[OK] Training configuration: {training_engine.get_training_status()}")
             
             # Execute training with automatic checkpoint resumption
             logger.info("Starting training...")
             final_state = training_engine.train(resume_from_checkpoint="auto")
             
-            logger.info("✓ Training completed successfully")
-            logger.info(f"✓ Final training state: {training_engine.get_training_status()}")
+            logger.info("[OK] Training completed successfully")
+            logger.info(f"[OK] Final training state: {training_engine.get_training_status()}")
         
         # ============================================================================
         # PHASE 6: INFERENCE VALIDATION AND RESULT REPORTING
@@ -549,12 +591,12 @@ def main() -> None:
                 samples_per_prompt=3
             )
             
-            logger.info("✓ Inference validation completed")
-            logger.info(f"✓ Validation results saved to: {validation_output_file}")
+            logger.info("[OK] Inference validation completed")
+            logger.info(f"[OK] Validation results saved to: {validation_output_file}")
             
             # Evaluate generation quality
             quality_metrics = inference_engine.evaluate_generation_quality(validation_results)
-            logger.info(f"✓ Generation quality metrics: {quality_metrics}")
+            logger.info(f"[OK] Generation quality metrics: {quality_metrics}")
         
         # ============================================================================
         # PHASE 7: FINAL CLEANUP AND SUMMARY REPORTING
