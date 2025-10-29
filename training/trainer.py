@@ -74,12 +74,15 @@ class TrainingProgressCallback(TrainerCallback):
             self.training_engine.metrics.current_step = state.global_step
             self.training_engine.metrics.current_epoch = state.epoch
             
-            # Calculate tokens per second (approximate)
-            if hasattr(kwargs.get('model'), 'config'):
-                seq_length = getattr(kwargs['model'].config, 'max_position_embeddings', 512)
+            # Calculate tokens per second (more accurate)
+            if step_time > 0:
+                # Use actual sequence length from config or default
+                seq_length = self.training_engine.config.max_length
                 batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
                 tokens_processed = batch_size * seq_length
-                self.training_engine.metrics.tokens_per_second = tokens_processed / step_time if step_time > 0 else 0
+                self.training_engine.metrics.tokens_per_second = tokens_processed / step_time
+            else:
+                self.training_engine.metrics.tokens_per_second = 0
                 
             # Log progress every 10 steps
             if state.global_step % 10 == 0:
@@ -90,10 +93,20 @@ class TrainingProgressCallback(TrainerCallback):
                 # Get latest log entry safely
                 latest_log = state.log_history[-1] if state.log_history else {}
                 
+                # Extract loss and learning rate with proper fallbacks
+                current_loss = latest_log.get('loss', latest_log.get('train_loss', self.training_engine.metrics.train_loss))
+                current_lr = latest_log.get('learning_rate', self.training_engine.metrics.learning_rate)
+                
+                # Handle NaN and invalid values
+                if current_loss is None or (isinstance(current_loss, float) and (current_loss != current_loss)):  # NaN check
+                    current_loss = 0.0
+                if current_lr is None or (isinstance(current_lr, float) and (current_lr != current_lr)):  # NaN check
+                    current_lr = 0.0
+                
                 logger.info(
                     f"Step {state.global_step}/{state.max_steps} ({progress:.1f}%) | "
-                    f"Loss: {latest_log.get('train_loss', 0.0):.4f} | "
-                    f"LR: {latest_log.get('learning_rate', 0.0):.2e} | "
+                    f"Loss: {current_loss:.4f} | "
+                    f"LR: {current_lr:.2e} | "
                     f"Tokens/s: {self.training_engine.metrics.tokens_per_second:.0f} | "
                     f"ETA: {eta/60:.1f}min"
                 )
@@ -101,10 +114,17 @@ class TrainingProgressCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         """Called when logging occurs."""
         if logs:
-            # Update metrics from logs
-            self.training_engine.metrics.train_loss = logs.get('train_loss', self.training_engine.metrics.train_loss)
-            self.training_engine.metrics.learning_rate = logs.get('learning_rate', self.training_engine.metrics.learning_rate)
-            self.training_engine.metrics.grad_norm = logs.get('grad_norm', self.training_engine.metrics.grad_norm)
+            # Update metrics from logs (handle both 'loss' and 'train_loss' keys)
+            if 'loss' in logs:
+                self.training_engine.metrics.train_loss = logs['loss']
+            elif 'train_loss' in logs:
+                self.training_engine.metrics.train_loss = logs['train_loss']
+                
+            if 'learning_rate' in logs:
+                self.training_engine.metrics.learning_rate = logs['learning_rate']
+                
+            if 'grad_norm' in logs:
+                self.training_engine.metrics.grad_norm = logs['grad_norm']
             
             # Save metrics to file
             self.training_engine._save_training_metrics(logs)
