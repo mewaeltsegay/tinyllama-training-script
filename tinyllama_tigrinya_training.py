@@ -132,6 +132,13 @@ def parse_arguments() -> TrainingConfig:
     
     # Small dataset optimization
     parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to use from dataset (for testing/debugging)"
+    )
+    
+    parser.add_argument(
         "--warmup-ratio",
         type=float,
         default=0.1,
@@ -284,6 +291,7 @@ def parse_arguments() -> TrainingConfig:
         tokenizer_dir=args.tokenizer_dir,
         output_dir=args.output_dir,
         checkpoint_steps=args.checkpoint_steps,
+        max_samples=args.max_samples,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
@@ -443,7 +451,8 @@ def main() -> None:
                 max_length=config.max_length,
                 streaming=False,  # Use non-streaming for small datasets
                 seed=42,
-                small_dataset_config=small_dataset_config
+                small_dataset_config=small_dataset_config,
+                max_samples=config.max_samples
             )
             
             # Validate dataset format

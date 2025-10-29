@@ -34,6 +34,7 @@ class TrainingConfig:
     checkpoint_steps: int = 500
     
     # Small dataset optimization parameters
+    max_samples: Optional[int] = None  # Limit dataset size for testing
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
