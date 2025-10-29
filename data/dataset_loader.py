@@ -416,18 +416,32 @@ class TigrinyaDatasetLoader:
         Returns:
             Tokenized examples
         """
-        # Tokenize the texts
+        # Tokenize the texts with proper padding and truncation
         tokenized = self.tokenizer(
             examples["text"],
             truncation=True,
             padding=False,  # We'll pad in the data collator
             max_length=self.max_length,
             return_attention_mask=False,  # Not needed for causal LM
-            return_token_type_ids=False
+            return_token_type_ids=False,
+            return_tensors=None  # Return lists, not tensors
         )
         
         # For causal language modeling, labels are the same as input_ids
-        tokenized["labels"] = tokenized["input_ids"].copy()
+        # Ensure labels are properly formatted as lists
+        if isinstance(tokenized["input_ids"][0], list):
+            tokenized["labels"] = [ids.copy() for ids in tokenized["input_ids"]]
+        else:
+            tokenized["labels"] = tokenized["input_ids"].copy()
+        
+        # Validate tokenization results
+        if len(tokenized["input_ids"]) != len(tokenized["labels"]):
+            raise ValueError(f"Mismatch between input_ids and labels length: {len(tokenized['input_ids'])} vs {len(tokenized['labels'])}")
+        
+        # Check for any sequences that are too long
+        for i, ids in enumerate(tokenized["input_ids"]):
+            if len(ids) > self.max_length:
+                logger.warning(f"Sequence {i} length {len(ids)} exceeds max_length {self.max_length}")
         
         return tokenized
     
@@ -500,18 +514,76 @@ class TigrinyaDatasetLoader:
         Returns:
             Data collator instance
         """
-        # Use the standard DataCollatorForLanguageModeling for better compatibility
+        # Use a custom data collator that handles variable-length sequences safely
         from transformers import DataCollatorForLanguageModeling
+        import torch
+        from typing import Dict, List, Any
         
-        data_collator = DataCollatorForLanguageModeling(
+        class SafeDataCollatorForCausalLM:
+            """Custom data collator that safely handles variable-length sequences."""
+            
+            def __init__(self, tokenizer, pad_to_multiple_of=8):
+                self.tokenizer = tokenizer
+                self.pad_to_multiple_of = pad_to_multiple_of
+                
+                # Ensure pad token is set
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+                # Extract input_ids and labels
+                input_ids = [f["input_ids"] for f in features]
+                labels = [f["labels"] for f in features]
+                
+                # Find the maximum length in this batch
+                max_length = max(len(ids) for ids in input_ids)
+                
+                # Pad to multiple of pad_to_multiple_of if specified
+                if self.pad_to_multiple_of:
+                    max_length = ((max_length + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of) * self.pad_to_multiple_of
+                
+                # Pad sequences
+                padded_input_ids = []
+                padded_labels = []
+                attention_mask = []
+                
+                for ids, lbls in zip(input_ids, labels):
+                    # Pad input_ids
+                    padding_length = max_length - len(ids)
+                    padded_ids = ids + [self.tokenizer.pad_token_id] * padding_length
+                    padded_input_ids.append(padded_ids)
+                    
+                    # Pad labels (use -100 for padded positions to ignore in loss)
+                    padded_lbls = lbls + [-100] * padding_length
+                    padded_labels.append(padded_lbls)
+                    
+                    # Create attention mask
+                    mask = [1] * len(ids) + [0] * padding_length
+                    attention_mask.append(mask)
+                
+                return {
+                    "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
+                    "labels": torch.tensor(padded_labels, dtype=torch.long),
+                    "attention_mask": torch.tensor(attention_mask, dtype=torch.long)
+                }
+        
+        # Use the safe data collator
+        data_collator = SafeDataCollatorForCausalLM(
             tokenizer=self.tokenizer,
-            mlm=mlm,
-            mlm_probability=0.15 if mlm else None,
-            pad_to_multiple_of=8,
-            return_tensors="pt"
+            pad_to_multiple_of=8
         )
         
-        logger.info(f"Created data collator for {'masked' if mlm else 'causal'} language modeling")
+        # Ensure the tokenizer has proper padding configuration
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            logger.info("Set pad_token to eos_token for proper padding")
+        
+        logger.info(f"Created safe data collator for causal language modeling")
+        logger.info(f"Tokenizer pad_token: {self.tokenizer.pad_token}")
+        logger.info(f"Tokenizer pad_token_id: {self.tokenizer.pad_token_id}")
+        logger.info(f"Max sequence length: {self.max_length}")
+        logger.info(f"Pad to multiple of: 8")
+        
         return data_collator
     
     def get_dataset_info(self) -> Dict[str, Any]:

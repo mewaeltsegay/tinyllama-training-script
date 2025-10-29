@@ -599,11 +599,36 @@ def main() -> None:
             logger.info(f"[OK] Generation quality metrics: {quality_metrics}")
         
         # ============================================================================
-        # PHASE 7: FINAL CLEANUP AND SUMMARY REPORTING
+        # PHASE 7: VISUALIZATION AND PLOTTING
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 7: Final Cleanup and Summary Reporting")
+        logger.info("PHASE 7: Creating Training Visualizations")
+        logger.info("-" * 50)
+        
+        try:
+            from utils.plotting import TrainingPlotter, create_plots_from_training_output
+            
+            # Create comprehensive plots and dashboard
+            logger.info("Creating training plots and dashboard...")
+            created_plots = create_plots_from_training_output(str(output_dir))
+            
+            logger.info(f"[OK] Created {len(created_plots)} visualization files:")
+            for plot_path in created_plots:
+                logger.info(f"  - {plot_path}")
+                
+        except ImportError as e:
+            logger.warning(f"Plotting dependencies not available: {e}")
+            logger.warning("Install matplotlib and seaborn for visualization: pip install matplotlib seaborn")
+        except Exception as e:
+            logger.warning(f"Failed to create plots: {e}")
+        
+        # ============================================================================
+        # PHASE 8: FINAL CLEANUP AND SUMMARY REPORTING
+        # ============================================================================
+        
+        logger.info("-" * 50)
+        logger.info("PHASE 8: Final Cleanup and Summary Reporting")
         logger.info("-" * 50)
         
         # Calculate total execution time

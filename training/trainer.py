@@ -328,6 +328,15 @@ class TrainingEngine:
         )
         
         # Apply hardware-specific optimizations
+        gpu_name = self.hardware_config.get("gpu_name", "")
+        if "H100" in gpu_name:
+            logger.info("Applying H100-specific optimizations...")
+            # H100 optimizations
+            if hasattr(trainer.args, 'dataloader_pin_memory'):
+                trainer.args.dataloader_pin_memory = True
+            if hasattr(trainer.args, 'dataloader_persistent_workers'):
+                trainer.args.dataloader_persistent_workers = False  # Avoid issues with persistent workers
+            logger.info("H100 optimizations applied")
         self._apply_hardware_optimizations(trainer)
         
         self.trainer = trainer
@@ -567,6 +576,23 @@ class TrainingEngine:
         """Save final training metrics and summary."""
         final_metrics_path = self.output_dir / "final_metrics.json"
         
+        # Extract step-by-step training history if available
+        training_history = []
+        if hasattr(self.trainer, 'state') and hasattr(self.trainer.state, 'log_history'):
+            training_history = self.trainer.state.log_history
+        
+        # Process training history for plotting
+        loss_history = []
+        lr_history = []
+        step_history = []
+        
+        for entry in training_history:
+            if 'loss' in entry and 'step' in entry:
+                loss_history.append(entry['loss'])
+                step_history.append(entry['step'])
+            if 'learning_rate' in entry:
+                lr_history.append(entry['learning_rate'])
+        
         final_metrics = {
             "training_loss": train_result.training_loss,
             "global_step": train_result.global_step,
@@ -578,13 +604,21 @@ class TrainingEngine:
                 "vocab_size": len(self.tokenizer),
                 "max_length": self.config.max_length
             },
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            # Add step-by-step data for plotting
+            "training_history": {
+                "loss_history": loss_history,
+                "lr_history": lr_history,
+                "step_history": step_history,
+                "full_log_history": training_history
+            }
         }
         
         with open(final_metrics_path, 'w', encoding='utf-8') as f:
             json.dump(final_metrics, f, indent=2, ensure_ascii=False)
         
         logger.info(f"Final metrics saved to {final_metrics_path}")
+        logger.info(f"Captured {len(loss_history)} training steps for plotting")
     
     def get_training_status(self) -> Dict[str, Any]:
         """
