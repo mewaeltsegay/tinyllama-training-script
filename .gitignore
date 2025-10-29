@@ -132,14 +132,13 @@ checkpoints/
 
 # Datasets (large files)
 dataset/
-data/
 datasets/
 *.jsonl
 *.json
 *.csv
 *.tsv
-*.txt
 *.parquet
+*.whl
 
 # Tokenizer files (can be large)
 tokenizer/

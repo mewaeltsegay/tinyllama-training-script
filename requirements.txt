@@ -1,0 +1,15 @@
+# Core dependencies for TinyLlama Tigrinya training
+torch>=2.0.0
+transformers>=4.35.0
+datasets>=2.14.0
+sentencepiece>=0.1.99
+accelerate>=0.24.0
+protobuf
+
+# Optional optimizations
+# flash_attn-2.7.0.post2%2Bcu124torch2.4.0cxx11abiFALSE-cp310-cp310-win_amd64.whl  # For supported GPUs (uncomment if needed)
+# bitsandbytes>=0.41.0  # For memory optimization (uncomment if needed)
+
+# Development and testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
