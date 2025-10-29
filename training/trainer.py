@@ -100,8 +100,14 @@ class TrainingProgressCallback(TrainerCallback):
                 # Handle NaN and invalid values
                 if current_loss is None or (isinstance(current_loss, float) and (current_loss != current_loss)):  # NaN check
                     current_loss = 0.0
+                    logger.warning("Loss is NaN or None, setting to 0.0")
                 if current_lr is None or (isinstance(current_lr, float) and (current_lr != current_lr)):  # NaN check
                     current_lr = 0.0
+                    logger.warning("Learning rate is NaN or None, setting to 0.0")
+                
+                # Check for problematic loss values
+                if isinstance(current_loss, float) and current_loss == 0.0 and state.global_step > 10:
+                    logger.warning(f"Loss is exactly 0.0 at step {state.global_step} - possible data quality issue")
                 
                 logger.info(
                     f"Step {state.global_step}/{state.max_steps} ({progress:.1f}%) | "
@@ -238,10 +244,10 @@ class TrainingEngine:
         per_device_batch_size = self.hardware_config.get("batch_size", self.config.batch_size or 1)
         gradient_accumulation_steps = self.hardware_config.get("gradient_accumulation_steps", self.config.gradient_accumulation_steps or 1)
         
-        # Mixed precision settings
-        mixed_precision_dtype = self.hardware_config.get("mixed_precision_dtype", "fp16")
-        fp16 = mixed_precision_dtype == "fp16" and self.config.mixed_precision
-        bf16 = mixed_precision_dtype == "bf16" and self.config.mixed_precision
+        # Mixed precision settings - disable for stability
+        mixed_precision_dtype = self.hardware_config.get("mixed_precision_dtype", "fp32")
+        fp16 = False  # Disable FP16 to prevent NaN gradients
+        bf16 = False  # Disable BF16 to prevent NaN gradients
         
         # Optimization settings
         dataloader_num_workers = self.hardware_config.get("dataloader_num_workers", 4)
@@ -261,19 +267,20 @@ class TrainingEngine:
             max_steps=max_steps,
             per_device_train_batch_size=per_device_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=self.config.learning_rate,
+            learning_rate=self.config.learning_rate * 0.1,  # Reduce learning rate to prevent NaN
             weight_decay=self.config.weight_decay,
-            max_grad_norm=self.config.max_grad_norm,
+            max_grad_norm=0.1,  # Very aggressive gradient clipping to prevent NaN
             
             # Learning rate scheduling
             lr_scheduler_type=self.config.scheduler_type,
             warmup_ratio=self.config.warmup_ratio,
             
-            # Mixed precision
-            fp16=fp16,
-            bf16=bf16,
-            fp16_full_eval=fp16,
-            bf16_full_eval=bf16,
+            # Disable mixed precision for stability
+            fp16=False,
+            bf16=False,
+            fp16_full_eval=False,
+            bf16_full_eval=False,
+            dataloader_drop_last=True,  # Ensure consistent batch sizes
             
             # Checkpointing
             save_strategy="steps",
@@ -335,6 +342,19 @@ class TrainingEngine:
         
         # Create custom callback
         progress_callback = TrainingProgressCallback(self)
+        
+        # Initialize model weights properly to prevent NaN
+        def init_weights(module):
+            if isinstance(module, torch.nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=0.02)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, torch.nn.Embedding):
+                module.weight.data.normal_(mean=0.0, std=0.02)
+        
+        # Apply weight initialization
+        self.model.apply(init_weights)
+        logger.info("Applied proper weight initialization to prevent NaN gradients")
         
         # Create trainer
         trainer = Trainer(
