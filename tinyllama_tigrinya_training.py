@@ -378,7 +378,7 @@ def main() -> None:
     from data.fixed_data_collator import create_fixed_data_collator, LossValidator
     from utils.gradient_stabilizer import create_gradient_stabilizer
 
-    from utils.stability_configurator import create_stability_configurator
+    from utils.minimal_stability import create_minimal_stability_configurator
     
     structured_logger = None
     recovery_manager = None
@@ -473,8 +473,8 @@ def main() -> None:
             hardware_detector = HardwareDetector()
             hardware_detector.log_hardware_info()
             
-            # Create stability configurator with hardware detection
-            stability_configurator = create_stability_configurator()
+            # Create minimal stability configurator (no complex recovery needed)
+            stability_configurator = create_minimal_stability_configurator()
             stability_config = stability_configurator.detect_and_configure()
             
             logger.info(f"[OK] Stability configuration: {stability_config}")

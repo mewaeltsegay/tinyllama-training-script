@@ -50,13 +50,21 @@ class StabilityConfigurator:
             gpu_type = self._map_gpu_name_to_type(gpu_name)
             self.mixed_precision_manager = MixedPrecisionManager(gpu_type=gpu_type)
             
-            # Create stability manager
-            self.stability_manager = create_stability_manager(
+            # Create stability manager with higher recovery limit for small datasets
+            from .training_stability import StabilityConfig
+            stability_config = StabilityConfig(
                 max_grad_norm=1.0,
                 gpu_type=gpu_type,
-                enable_mixed_precision=self.gpu_config.get("mixed_precision", True),
-                enable_nan_recovery=True
+                mixed_precision_enabled=self.gpu_config.get("mixed_precision", True),
+                nan_recovery_enabled=True,
+                max_nan_recoveries=20,  # Higher limit for small datasets
+                lr_reduction_factor=0.8,  # More conservative LR reduction
+                gradient_stats_interval=5,  # More frequent monitoring
+                stability_report_interval=10
             )
+            
+            from .training_stability import TrainingStabilityManager
+            self.stability_manager = TrainingStabilityManager(config=stability_config)
             
             # Build comprehensive stability configuration
             self.stability_config = {
