@@ -159,6 +159,30 @@ class HardwareDetector:
                 logger.warning(f"Optimization settings failed: {e}, using safe defaults")
                 optimizations = self._get_safe_optimizations()
             
+            # Get mixed precision settings with error handling
+            try:
+                from .mixed_precision_manager import MixedPrecisionManager
+                mp_manager = MixedPrecisionManager(gpu_type=gpu_config.name)
+                mixed_precision_config = mp_manager.get_precision_config()
+            except Exception as e:
+                detection_errors.append(f"Mixed precision config failed: {e}")
+                logger.warning(f"Mixed precision config failed: {e}, using fallback")
+                mixed_precision_config = {
+                    "fp16": gpu_config.mixed_precision_dtype == "fp16",
+                    "bf16": gpu_config.mixed_precision_dtype == "bf16",
+                    "fp16_opt_level": "O1",
+                    "loss_scale": 128.0 if gpu_config.mixed_precision_dtype == "fp16" else None,
+                    "dataloader_pin_memory": True,
+                    "torch_compile": False,
+                    "gradient_scaler_config": {
+                        "enabled": gpu_config.mixed_precision_dtype == "fp16",
+                        "init_scale": 128.0,
+                        "growth_factor": 1.1,
+                        "backoff_factor": 0.8,
+                        "growth_interval": 1000
+                    }
+                }
+            
             # Build final configuration
             config = {
                 "gpu_name": gpu_config.name,
@@ -171,6 +195,7 @@ class HardwareDetector:
                 "enable_gradient_checkpointing": gpu_config.enable_gradient_checkpointing,
                 "max_memory_usage": gpu_config.max_memory_usage,
                 "detection_errors": detection_errors,
+                "mixed_precision_config": mixed_precision_config,
                 **optimizations
             }
             
@@ -303,6 +328,13 @@ class HardwareDetector:
         if gpu_type in ["A100", "H100"]:
             optimizations["use_compile"] = True  # PyTorch 2.0 compile for newer GPUs
             optimizations["dataloader_num_workers"] = 0  # Keep 0 for Windows
+            
+            # H100-specific additional optimizations
+            if gpu_type == "H100":
+                optimizations["enable_flash_attention_2"] = True  # Flash Attention 2 for H100
+                optimizations["use_fused_adamw"] = True  # Fused AdamW optimizer
+                optimizations["enable_tf32"] = True  # TensorFloat-32 for H100
+                optimizations["use_channels_last"] = True  # Memory layout optimization
         elif gpu_type == "RTX 4050":
             optimizations["use_8bit_optimizer"] = False  # Disable to avoid FP16 gradient issues
             optimizations["dataloader_num_workers"] = 0  # Keep 0 for Windows
@@ -602,6 +634,31 @@ class HardwareDetector:
             logger.error(f"Failed to get memory info: {e}")
             return None
     
+    def get_mixed_precision_manager(self) -> Optional['MixedPrecisionManager']:
+        """
+        Get MixedPrecisionManager instance for detected hardware.
+        
+        Returns:
+            MixedPrecisionManager instance or None if detection failed
+        """
+        try:
+            from .mixed_precision_manager import MixedPrecisionManager
+            
+            if self.detected_config:
+                gpu_name = self.detected_config.get("gpu_name", "default")
+                return MixedPrecisionManager(gpu_type=gpu_name)
+            else:
+                # Try to detect GPU for mixed precision manager
+                if torch.cuda.is_available():
+                    gpu_name = torch.cuda.get_device_name(0)
+                    return MixedPrecisionManager(gpu_type=gpu_name)
+                else:
+                    return MixedPrecisionManager(gpu_type="default")
+                    
+        except Exception as e:
+            logger.error(f"Failed to create MixedPrecisionManager: {e}")
+            return None
+    
     def log_hardware_info(self):
         """Log detailed hardware information."""
         if torch.cuda.is_available():
@@ -620,4 +677,13 @@ class HardwareDetector:
         if self.detected_config:
             logger.info("Detected Configuration:")
             for key, value in self.detected_config.items():
-                logger.info(f"  {key}: {value}")
+                if key != "mixed_precision_config":  # Skip detailed MP config in summary
+                    logger.info(f"  {key}: {value}")
+            
+            # Log mixed precision configuration separately
+            if "mixed_precision_config" in self.detected_config:
+                mp_config = self.detected_config["mixed_precision_config"]
+                logger.info("Mixed Precision Configuration:")
+                logger.info(f"  FP16: {mp_config.get('fp16', False)}")
+                logger.info(f"  BF16: {mp_config.get('bf16', False)}")
+                logger.info(f"  Gradient Scaler: {mp_config.get('gradient_scaler_config', {}).get('enabled', False)}")

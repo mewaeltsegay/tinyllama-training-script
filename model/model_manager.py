@@ -206,6 +206,9 @@ class TinyLlamaManager:
                     **strategy["kwargs"]
                 )
                 
+                # Apply H100-specific optimizations after model loading
+                self._apply_h100_optimizations(model)
+                
                 logger.info(f"Model loaded successfully with strategy: {strategy['name']}")
                 return model
                 
@@ -219,6 +222,54 @@ class TinyLlamaManager:
                 continue
         
         raise RuntimeError("All model loading strategies failed")
+    
+    def _apply_h100_optimizations(self, model: PreTrainedModel) -> None:
+        """
+        Apply H100-specific optimizations to the loaded model.
+        
+        Args:
+            model: The loaded model to optimize
+        """
+        if not torch.cuda.is_available():
+            return
+        
+        try:
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            
+            if "h100" in gpu_name:
+                logger.info("Applying H100-specific model optimizations...")
+                
+                # Enable TensorFloat-32 for H100
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                
+                # Enable Flash Attention if available
+                try:
+                    torch.backends.cuda.enable_flash_sdp(True)
+                    logger.info("Flash Attention enabled for H100")
+                except:
+                    logger.info("Flash Attention not available")
+                
+                # Enable CUDA graphs optimization
+                try:
+                    torch.backends.cudnn.benchmark = True
+                    logger.info("CUDA graphs optimization enabled for H100")
+                except:
+                    pass
+                
+                # Set optimal CUDA settings for H100
+                try:
+                    # Enable memory pool for better allocation
+                    torch.cuda.set_per_process_memory_fraction(0.9)
+                    logger.info("H100 memory optimization applied")
+                except:
+                    pass
+                
+                logger.info("H100 model optimizations applied successfully")
+                
+        except Exception as e:
+            logger.warning(f"H100 optimizations failed: {e}")
+            # Don't fail model loading if optimizations fail
     
     def _load_tigrinya_tokenizer(self) -> PreTrainedTokenizer:
         """

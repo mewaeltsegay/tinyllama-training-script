@@ -262,7 +262,7 @@ def create_small_dataset_training_args(
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        report_to=None,  # Disable wandb/tensorboard by default
+        report_to=["tensorboard"],  # Use tensorboard for logging
         remove_unused_columns=False,
         dataloader_pin_memory=False,
         fp16=config.get("mixed_precision", True) and torch.cuda.is_available(),

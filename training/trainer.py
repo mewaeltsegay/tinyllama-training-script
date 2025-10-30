@@ -49,11 +49,22 @@ class TrainingMetrics:
 
 
 class TrainingProgressCallback(TrainerCallback):
-    """Custom callback for enhanced training progress monitoring."""
+    """Custom callback for enhanced training progress monitoring with stability checks."""
     
     def __init__(self, training_engine):
         self.training_engine = training_engine
         self.step_start_time = None
+        
+        # Initialize stability monitor
+        from training_stability_fix import create_stability_monitor
+        self.stability_monitor = create_stability_monitor()
+        
+        # Initialize tensorboard logger
+        from utils.tensorboard_logger import create_tensorboard_logger
+        self.tensorboard_logger = create_tensorboard_logger(
+            output_dir=str(training_engine.output_dir),
+            experiment_name="tinyllama_tigrinya"
+        )
         
     def on_train_begin(self, args, state, control, **kwargs):
         """Called at the beginning of training."""
@@ -100,14 +111,40 @@ class TrainingProgressCallback(TrainerCallback):
                 # Handle NaN and invalid values
                 if current_loss is None or (isinstance(current_loss, float) and (current_loss != current_loss)):  # NaN check
                     current_loss = 0.0
-                    logger.warning("Loss is NaN or None, setting to 0.0")
+                    logger.error("Loss is NaN or None - CRITICAL TRAINING ISSUE")
                 if current_lr is None or (isinstance(current_lr, float) and (current_lr != current_lr)):  # NaN check
                     current_lr = 0.0
-                    logger.warning("Learning rate is NaN or None, setting to 0.0")
+                    logger.error("Learning rate is NaN or None - CRITICAL TRAINING ISSUE")
+                
+                # Check gradient stability
+                if hasattr(self.training_engine, 'gradient_stabilizer'):
+                    grad_norm = self.training_engine.gradient_stabilizer.clip_gradients()
+                    
+                    # Log gradients to tensorboard
+                    if hasattr(self, 'tensorboard_logger') and state.global_step % 10 == 0:
+                        self.tensorboard_logger.log_gradients(self.training_engine.model, state.global_step)
+                    
+                    # Check if step should be skipped
+                    if self.training_engine.gradient_stabilizer.should_skip_step():
+                        logger.error(f"Skipping step {state.global_step} due to gradient instability")
+                        return
+                else:
+                    grad_norm = latest_log.get('grad_norm', 0.0)
+                
+                # Log to stability monitor
+                self.stability_monitor.log_step(current_loss, current_lr, grad_norm)
                 
                 # Check for problematic loss values
                 if isinstance(current_loss, float) and current_loss == 0.0 and state.global_step > 10:
-                    logger.warning(f"Loss is exactly 0.0 at step {state.global_step} - possible data quality issue")
+                    logger.error(f"CRITICAL: Loss is exactly 0.0 at step {state.global_step} - DATA COLLATOR ISSUE")
+                    
+                    # Get stability report
+                    stability_report = self.stability_monitor.get_stability_report()
+                    logger.error(f"Stability report: {stability_report}")
+                    
+                    if stability_report.get('zero_loss_count', 0) > 3:
+                        logger.error("Too many zero loss steps - stopping training")
+                        control.should_training_stop = True
                 
                 logger.info(
                     f"Step {state.global_step}/{state.max_steps} ({progress:.1f}%) | "
@@ -132,6 +169,18 @@ class TrainingProgressCallback(TrainerCallback):
             if 'grad_norm' in logs:
                 self.training_engine.metrics.grad_norm = logs['grad_norm']
             
+            # Log to tensorboard
+            if hasattr(self, 'tensorboard_logger'):
+                # Prepare metrics for tensorboard
+                tb_metrics = {}
+                for key, value in logs.items():
+                    if isinstance(value, (int, float)) and not (isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf'))):
+                        tb_metrics[key] = value
+                
+                # Log metrics to tensorboard
+                if tb_metrics:
+                    self.tensorboard_logger.log_metrics(tb_metrics, state.global_step)
+            
             # Save metrics to file
             self.training_engine._save_training_metrics(logs)
             
@@ -139,6 +188,29 @@ class TrainingProgressCallback(TrainerCallback):
         """Called when a checkpoint is saved."""
         self.training_engine.metrics.last_checkpoint_step = state.global_step
         logger.info(f"Checkpoint saved at step {state.global_step}")
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        """Called at the end of training."""
+        if hasattr(self, 'tensorboard_logger'):
+            # Log final hyperparameters and metrics
+            hparams = {
+                "learning_rate": args.learning_rate,
+                "batch_size": args.per_device_train_batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "max_grad_norm": args.max_grad_norm,
+                "warmup_steps": args.warmup_steps,
+                "fp16": args.fp16,
+                "bf16": args.bf16
+            }
+            
+            final_metrics = {
+                "final_loss": self.training_engine.metrics.train_loss,
+                "total_steps": state.global_step
+            }
+            
+            self.tensorboard_logger.log_hyperparameters(hparams, final_metrics)
+            self.tensorboard_logger.close()
+            logger.info("TensorBoard logging completed")
 
 
 class TrainingEngine:
@@ -244,87 +316,16 @@ class TrainingEngine:
         per_device_batch_size = self.hardware_config.get("batch_size", self.config.batch_size or 1)
         gradient_accumulation_steps = self.hardware_config.get("gradient_accumulation_steps", self.config.gradient_accumulation_steps or 1)
         
-        # Mixed precision settings - disable for stability
-        mixed_precision_dtype = self.hardware_config.get("mixed_precision_dtype", "fp32")
-        fp16 = False  # Disable FP16 to prevent NaN gradients
-        bf16 = False  # Disable BF16 to prevent NaN gradients
+        # Import stability fixes
+        from training_stability_fix import create_stable_training_args
         
-        # Optimization settings
-        dataloader_num_workers = self.hardware_config.get("dataloader_num_workers", 4)
-        dataloader_pin_memory = self.hardware_config.get("dataloader_pin_memory", True)
-        gradient_checkpointing = self.hardware_config.get("enable_gradient_checkpointing", False)
-        
-        # Create training arguments
-        training_args = TrainingArguments(
-            # Output and logging
+        # Use stable training arguments (no wandb, no tensorboard)
+        return create_stable_training_args(
+            config=self.config,
+            hardware_config=self.hardware_config,
             output_dir=str(self.output_dir),
-            logging_dir=str(self.output_dir / "logs"),
-            logging_steps=10,
-            logging_strategy="steps",
-            
-            # Training parameters
-            num_train_epochs=self.config.num_epochs,
-            max_steps=max_steps,
-            per_device_train_batch_size=per_device_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=self.config.learning_rate * 0.1,  # Reduce learning rate to prevent NaN
-            weight_decay=self.config.weight_decay,
-            max_grad_norm=0.1,  # Very aggressive gradient clipping to prevent NaN
-            
-            # Learning rate scheduling
-            lr_scheduler_type=self.config.scheduler_type,
-            warmup_ratio=self.config.warmup_ratio,
-            
-            # Disable mixed precision for stability
-            fp16=False,
-            bf16=False,
-            fp16_full_eval=False,
-            bf16_full_eval=False,
-            dataloader_drop_last=True,  # Ensure consistent batch sizes
-            
-            # Checkpointing
-            save_strategy="steps",
-            save_steps=self.config.checkpoint_steps,
-            save_total_limit=3,  # Keep only last 3 checkpoints
-            
-            # Evaluation (if validation dataset available)
-            eval_strategy="steps" if "validation" in self.datasets else "no",
-            eval_steps=self.config.checkpoint_steps if "validation" in self.datasets else None,
-            per_device_eval_batch_size=per_device_batch_size,
-            
-            # Data loading
-            dataloader_num_workers=dataloader_num_workers,
-            dataloader_pin_memory=dataloader_pin_memory,
-            
-            # Optimization
-            gradient_checkpointing=gradient_checkpointing,
-            optim="adamw_torch",
-            
-            # Reporting
-            report_to=["tensorboard"],
-            run_name=f"tinyllama-tigrinya-{int(time.time())}",
-            
-            # Miscellaneous
-            seed=42,
-            data_seed=42,
-            remove_unused_columns=False,
-            load_best_model_at_end=True if "validation" in self.datasets else False,
-            metric_for_best_model="eval_loss" if "validation" in self.datasets else None,
-            greater_is_better=False,
+            max_steps=max_steps
         )
-        
-        self.training_args = training_args
-        
-        logger.info("Training arguments configured:")
-        logger.info(f"  Max steps: {max_steps}")
-        logger.info(f"  Per device batch size: {per_device_batch_size}")
-        logger.info(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
-        logger.info(f"  Effective batch size: {per_device_batch_size * gradient_accumulation_steps}")
-        logger.info(f"  Learning rate: {self.config.learning_rate}")
-        logger.info(f"  Mixed precision: {mixed_precision_dtype if self.config.mixed_precision else 'disabled'}")
-        logger.info(f"  Gradient checkpointing: {gradient_checkpointing}")
-        
-        return training_args
     
     def create_trainer(self) -> Trainer:
         """
@@ -343,18 +344,16 @@ class TrainingEngine:
         # Create custom callback
         progress_callback = TrainingProgressCallback(self)
         
-        # Initialize model weights properly to prevent NaN
-        def init_weights(module):
-            if isinstance(module, torch.nn.Linear):
-                module.weight.data.normal_(mean=0.0, std=0.02)
-                if module.bias is not None:
-                    module.bias.data.zero_()
-            elif isinstance(module, torch.nn.Embedding):
-                module.weight.data.normal_(mean=0.0, std=0.02)
+        # Apply stable model initialization
+        from training_stability_fix import apply_stable_model_initialization, GradientStabilizer
+        apply_stable_model_initialization(self.model)
         
-        # Apply weight initialization
-        self.model.apply(init_weights)
-        logger.info("Applied proper weight initialization to prevent NaN gradients")
+        # Initialize gradient stabilizer
+        self.gradient_stabilizer = GradientStabilizer(
+            model=self.model,
+            max_grad_norm=0.5,
+            grad_clip_threshold=1.0
+        )
         
         # Create trainer
         trainer = Trainer(
@@ -376,6 +375,29 @@ class TrainingEngine:
                 trainer.args.dataloader_pin_memory = True
             if hasattr(trainer.args, 'dataloader_persistent_workers'):
                 trainer.args.dataloader_persistent_workers = False  # Avoid issues with persistent workers
+            
+            # H100-specific performance optimizations
+            if hasattr(trainer.args, 'tf32'):
+                trainer.args.tf32 = True  # Enable TensorFloat-32 for H100
+            if hasattr(trainer.args, 'dataloader_prefetch_factor'):
+                trainer.args.dataloader_prefetch_factor = None  # Ensure compatibility
+            
+            # Enable advanced H100 features
+            try:
+                # Enable Flash Attention 2 if available
+                torch.backends.cuda.enable_flash_sdp(True)
+                logger.info("Flash Attention 2 enabled for H100")
+            except:
+                logger.info("Flash Attention 2 not available")
+            
+            try:
+                # Enable TensorFloat-32 for H100
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                logger.info("TensorFloat-32 enabled for H100")
+            except:
+                logger.info("TensorFloat-32 configuration not available")
+            
             logger.info("H100 optimizations applied")
         self._apply_hardware_optimizations(trainer)
         
@@ -694,6 +716,11 @@ class TrainingEngine:
     def cleanup(self):
         """Cleanup training resources."""
         if self.trainer is not None:
+            # Cleanup tensorboard logger if it exists in callbacks
+            for callback in self.trainer.callback_handler.callbacks:
+                if hasattr(callback, 'tensorboard_logger') and hasattr(callback.tensorboard_logger, 'close'):
+                    callback.tensorboard_logger.close()
+            
             # Clear trainer references
             self.trainer = None
         

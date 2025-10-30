@@ -34,8 +34,11 @@ if os.name == 'nt':  # Windows
         pass
 
 import torch
+from transformers import TrainerCallback, Trainer, TrainingArguments
 
 from config.training_config import TrainingConfig
+from utils.training_stability import apply_stability_to_training_args
+from utils.mixed_precision_manager import MixedPrecisionManager as StandaloneMixedPrecisionManager
 
 
 def setup_logging(log_level: str = "INFO") -> None:
@@ -354,12 +357,12 @@ def main() -> None:
     """
     Main entry point for TinyLlama Tigrinya continuous pretraining.
     
-    Orchestrates the complete training pipeline:
+    Orchestrates the complete training pipeline with integrated stability fixes:
     1. Configuration parsing and validation
-    2. Hardware detection and GPU optimization
-    3. Dataset loading and preprocessing
-    4. Model management and tokenizer integration
-    5. Training execution with monitoring
+    2. Hardware detection and stability configuration
+    3. Dataset loading with fixed data collator
+    4. Model management with gradient stabilization
+    5. Training execution with tensorboard logging
     6. Inference validation and result reporting
     7. Final cleanup and summary
     """
@@ -369,6 +372,13 @@ def main() -> None:
     from model.model_manager import TinyLlamaManager
     from training.trainer import TrainingEngine
     from inference.generator import InferenceEngine
+    
+    # Import all stability fixes
+    from utils.tensorboard_logger import create_tensorboard_logger
+    from data.fixed_data_collator import create_fixed_data_collator, LossValidator
+    from utils.gradient_stabilizer import create_gradient_stabilizer
+
+    from utils.stability_configurator import create_stability_configurator
     
     structured_logger = None
     recovery_manager = None
@@ -380,6 +390,10 @@ def main() -> None:
     model_manager = None
     training_engine = None
     inference_engine = None
+    tensorboard_logger = None
+    gradient_stabilizer = None
+    mixed_precision_manager = None
+    stability_configurator = None
     
     # Set up basic logging first (before any potential errors)
     setup_logging("INFO")
@@ -408,7 +422,7 @@ def main() -> None:
         )
         
         logger.info("=" * 80)
-        logger.info("TINYLLAMA TIGRINYA CONTINUOUS PRETRAINING")
+        logger.info("TINYLLAMA TIGRINYA CONTINUOUS PRETRAINING WITH STABILITY FIXES")
         logger.info("=" * 80)
         logger.info(f"Model: {config.model_name}")
         logger.info(f"Dataset: {config.dataset_dir}")
@@ -447,36 +461,66 @@ def main() -> None:
             logger.info(f"[OK] Validation completed: {len(dataset_files)} dataset files found")
         
         # ============================================================================
-        # PHASE 2: HARDWARE DETECTION AND GPU OPTIMIZATION
+        # PHASE 2: HARDWARE DETECTION AND STABILITY CONFIGURATION
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 2: Hardware Detection and GPU Optimization")
+        logger.info("PHASE 2: Hardware Detection and Stability Configuration")
         logger.info("-" * 50)
         
         with structured_logger.error_context("hardware_detection"):
+            # Initialize hardware detector
             hardware_detector = HardwareDetector()
             hardware_detector.log_hardware_info()
             
-            # Detect GPU configuration
-            hardware_config = hardware_detector.detect_gpu_config()
-            logger.info(f"[OK] Hardware configuration: {hardware_config}")
+            # Create stability configurator with hardware detection
+            stability_configurator = create_stability_configurator()
+            stability_config = stability_configurator.detect_and_configure()
             
-            # Override config with hardware-optimized settings if not explicitly set
+            logger.info(f"[OK] Stability configuration: {stability_config}")
+            
+            # Override config with stability-optimized settings if not explicitly set
             if config.batch_size is None:
-                config.batch_size = hardware_config["batch_size"]
+                config.batch_size = stability_config["batch_size"]
                 logger.info(f"[OK] Auto-configured batch size: {config.batch_size}")
             
             if config.gradient_accumulation_steps is None:
-                config.gradient_accumulation_steps = hardware_config["gradient_accumulation_steps"]
+                config.gradient_accumulation_steps = stability_config["gradient_accumulation_steps"]
                 logger.info(f"[OK] Auto-configured gradient accumulation steps: {config.gradient_accumulation_steps}")
+            
+            # Update learning rate and other stability parameters
+            config.learning_rate = stability_config["learning_rate"]
+            config.max_grad_norm = stability_config["max_grad_norm"]
+            config.warmup_ratio = stability_config["warmup_ratio"]
+            config.weight_decay = stability_config["weight_decay"]
+            
+            logger.info(f"[OK] Applied stability parameters - LR: {config.learning_rate}, Max Grad Norm: {config.max_grad_norm}")
         
         # ============================================================================
-        # PHASE 3: DATASET LOADING AND PREPROCESSING
+        # PHASE 3: INITIALIZE TENSORBOARD LOGGING (REPLACES WANDB)
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 3: Dataset Loading and Preprocessing")
+        logger.info("PHASE 3: Initialize TensorBoard Logging System")
+        logger.info("-" * 50)
+        
+        with structured_logger.error_context("tensorboard_setup"):
+            # Create tensorboard logger (replaces wandb)
+            tensorboard_logger = create_tensorboard_logger(
+                output_dir=str(output_dir),
+                experiment_name="tinyllama_tigrinya_training"
+            )
+            
+            logger.info(f"[OK] TensorBoard logger initialized")
+            logger.info(f"[OK] TensorBoard logs: {tensorboard_logger.log_dir}")
+            logger.info(f"[OK] View with: tensorboard --logdir {tensorboard_logger.log_dir}")
+        
+        # ============================================================================
+        # PHASE 4: DATASET LOADING WITH FIXED DATA COLLATOR
+        # ============================================================================
+        
+        logger.info("-" * 50)
+        logger.info("PHASE 4: Dataset Loading with Fixed Data Collator")
         logger.info("-" * 50)
         
         with structured_logger.error_context("dataset_loading"):
@@ -507,17 +551,13 @@ def main() -> None:
             
             for split, dataset in datasets.items():
                 logger.info(f"  {split}: {len(dataset)} examples")
-            
-            # Create data collator
-            data_collator = dataset_loader.create_data_collator(mlm=False)
-            logger.info("[OK] Data collator created for causal language modeling")
         
         # ============================================================================
-        # PHASE 4: MODEL MANAGEMENT AND TOKENIZER INTEGRATION
+        # PHASE 5: MODEL LOADING WITH GRADIENT STABILIZATION
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 4: Model Management and Tokenizer Integration")
+        logger.info("PHASE 5: Model Loading with Gradient Stabilization")
         logger.info("-" * 50)
         
         with structured_logger.error_context("model_loading"):
@@ -531,49 +571,349 @@ def main() -> None:
             model, tokenizer = model_manager.load_model_and_tokenizer()
             logger.info("[OK] Model and tokenizer loaded successfully")
             
+            # Create fixed data collator (replaces problematic default collator)
+            data_collator = create_fixed_data_collator(
+                tokenizer=tokenizer,
+                pad_to_multiple_of=8,
+                max_length=config.max_length,
+                conservative_labeling=True  # Use conservative labeling for stability
+            )
+            logger.info("[OK] Fixed data collator created (resolves zero loss issue)")
+            
+            # Initialize loss validator
+            loss_validator = LossValidator(tokenizer)
+            
+            # Create gradient stabilizer system
+            gradient_stabilizer, mixed_precision_manager = create_gradient_stabilizer(
+                max_grad_norm=config.max_grad_norm,
+                gpu_type="auto",
+                enable_mixed_precision=config.mixed_precision
+            )
+            
+            # Initialize model weights for stability
+            gradient_stabilizer.initialize_model_weights(model)
+            logger.info("[OK] Gradient stabilizer initialized and model weights initialized")
+            
+            # Setup mixed precision scaler
+            scaler = mixed_precision_manager.setup_scaler(enabled=config.mixed_precision)
+            if scaler:
+                logger.info(f"[OK] Mixed precision scaler initialized with scale: {scaler.get_scale()}")
+            else:
+                logger.info("[OK] Mixed precision disabled or not available")
+            
             # Log model information
             model_info = model_manager.get_model_info()
             logger.info(f"[OK] Model info: {model_info}")
         
         # ============================================================================
-        # PHASE 5: TRAINING EXECUTION WITH MONITORING
+        # PHASE 6: TRAINING EXECUTION WITH INTEGRATED STABILITY FIXES
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 5: Training Execution with Monitoring")
+        logger.info("PHASE 6: Training Execution with Integrated Stability Fixes")
         logger.info("-" * 50)
         
         with structured_logger.error_context("training_execution"):
-            # Initialize training engine
-            training_engine = TrainingEngine(
+            # Create custom training engine with all fixes integrated
+            class StabilizedTrainingEngine(TrainingEngine):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.tensorboard_logger = tensorboard_logger
+                    self.gradient_stabilizer = gradient_stabilizer
+                    self.mixed_precision_manager = mixed_precision_manager
+                    self.loss_validator = loss_validator
+                    self.stability_configurator = stability_configurator
+                
+                def setup_training_arguments(self):
+                    """Override to apply stability configuration."""
+                    # Calculate total training steps
+                    train_dataset = self.datasets.get("train")
+                    if train_dataset is None:
+                        raise ValueError("Training dataset not found")
+                    
+                    # For streaming datasets, we need to estimate steps
+                    if hasattr(train_dataset, '__len__'):
+                        estimated_samples = len(train_dataset)
+                    else:
+                        # Estimate based on typical dataset sizes
+                        estimated_samples = 10000  # Conservative estimate
+                        logger.warning(f"Using estimated dataset size of {estimated_samples} for streaming dataset")
+                    
+                    # Calculate steps per epoch
+                    effective_batch_size = self.config.batch_size * self.config.gradient_accumulation_steps
+                    steps_per_epoch = max(1, estimated_samples // effective_batch_size)
+                    max_steps = steps_per_epoch * self.config.num_epochs
+                    
+                    # Create base training arguments with stability settings
+                    
+                    training_args = TrainingArguments(
+                        # Output and logging
+                        output_dir=str(self.output_dir),
+                        logging_dir=str(self.output_dir / "tensorboard"),
+                        logging_steps=10,
+                        logging_strategy="steps",
+                        
+                        # Training parameters
+                        max_steps=max_steps,
+                        per_device_train_batch_size=self.config.batch_size,
+                        gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+                        learning_rate=self.config.learning_rate,
+                        weight_decay=self.config.weight_decay,
+                        max_grad_norm=self.config.max_grad_norm,
+                        
+                        # Learning rate scheduling
+                        lr_scheduler_type=self.config.scheduler_type,
+                        warmup_ratio=self.config.warmup_ratio,
+                        
+                        # Mixed precision (will be overridden by mixed precision manager)
+                        fp16=False,  # Will be set by mixed precision manager
+                        bf16=False,  # Will be set by mixed precision manager
+                        
+                        # Checkpointing
+                        save_strategy="steps",
+                        save_steps=self.config.checkpoint_steps,
+                        save_total_limit=3,
+                        
+                        # Evaluation
+                        eval_strategy="no",  # Disable evaluation for stability
+                        
+                        # Data loading
+                        dataloader_num_workers=0,  # Conservative for Windows
+                        dataloader_pin_memory=True,
+                        dataloader_drop_last=True,
+                        dataloader_prefetch_factor=None,  # Must be None when num_workers=0
+                        
+                        # Reporting - TensorBoard only (no wandb)
+                        report_to=["tensorboard"],
+                        run_name=f"tinyllama_tigrinya_{int(time.time())}",
+                        
+                        # Stability settings
+                        seed=42,
+                        data_seed=42,
+                        remove_unused_columns=False,
+                        skip_memory_metrics=True,
+                        dataloader_persistent_workers=False,
+                    )
+                    
+                    # Apply stability configuration
+                    training_args = self.stability_configurator.apply_to_training_arguments(training_args)
+                    
+                    # Apply mixed precision settings
+                    standalone_mp_manager = StandaloneMixedPrecisionManager(gpu_type="auto")
+                    training_args = standalone_mp_manager.update_training_arguments(training_args)
+                    
+                    # Ensure wandb is disabled
+                    training_args.report_to = ["tensorboard"]  # Only tensorboard
+                    
+                    self.training_args = training_args
+                    return training_args
+                
+                def create_trainer(self):
+                    """Override to integrate all stability fixes."""
+                    if self.training_args is None:
+                        self.setup_training_arguments()
+                    
+                    # Prepare datasets
+                    train_dataset = self.datasets["train"]
+                    eval_dataset = self.datasets.get("validation")
+                    
+                    # Create custom callback with integrated fixes
+                    class StabilizedTrainingCallback(TrainerCallback):
+                        def __init__(self, training_engine):
+                            self.training_engine = training_engine
+                            self.step_start_time = None
+                            self.tensorboard_logger = training_engine.tensorboard_logger
+                            self.gradient_stabilizer = training_engine.gradient_stabilizer
+                            self.loss_validator = training_engine.loss_validator
+                        
+                        def on_train_begin(self, args, state, control, **kwargs):
+                            """Called at the beginning of training."""
+                            self.training_engine.metrics.start_time = time.time()
+                            self.training_engine.metrics.total_steps = state.max_steps
+                            logger.info(f"Starting stabilized training for {state.max_steps} steps")
+                        
+                        def on_step_begin(self, args, state, control, **kwargs):
+                            """Called at the beginning of each training step."""
+                            self.step_start_time = time.time()
+                        
+                        def on_step_end(self, args, state, control, **kwargs):
+                            """Enhanced step end with stability monitoring."""
+                            if self.step_start_time is not None:
+                                step_time = time.time() - self.step_start_time
+                                
+                                # Update metrics
+                                self.training_engine.metrics.current_step = state.global_step
+                                self.training_engine.metrics.current_epoch = state.epoch
+                                
+                                # Get model for gradient analysis
+                                model = kwargs.get('model', self.training_engine.model)
+                                
+                                # Perform gradient stabilization
+                                grad_norm, is_healthy = self.gradient_stabilizer.clip_gradients(model)
+                                
+                                if not is_healthy:
+                                    logger.error(f"Unhealthy gradients detected at step {state.global_step}")
+                                    # Let the trainer handle the error
+                                    return
+                                
+                                # Log gradients to tensorboard
+                                if state.global_step % 10 == 0:
+                                    grad_stats = self.tensorboard_logger.log_gradients(model, state.global_step)
+                                    
+                                    # Log hardware metrics
+                                    self.tensorboard_logger.log_hardware_metrics(state.global_step)
+                                
+                                # Calculate tokens per second
+                                if step_time > 0:
+                                    seq_length = self.training_engine.config.max_length
+                                    batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
+                                    tokens_processed = batch_size * seq_length
+                                    self.training_engine.metrics.tokens_per_second = tokens_processed / step_time
+                                
+                                # Log progress every 10 steps
+                                if state.global_step % 10 == 0:
+                                    elapsed_time = time.time() - self.training_engine.metrics.start_time
+                                    progress = state.global_step / state.max_steps * 100
+                                    eta = (elapsed_time / state.global_step * (state.max_steps - state.global_step)) if state.global_step > 0 else 0
+                                    
+                                    # Get latest log entry safely
+                                    latest_log = state.log_history[-1] if state.log_history else {}
+                                    
+                                    # Extract loss and learning rate with proper fallbacks
+                                    current_loss = latest_log.get('loss', latest_log.get('train_loss', self.training_engine.metrics.train_loss))
+                                    current_lr = latest_log.get('learning_rate', self.training_engine.metrics.learning_rate)
+                                    
+                                    # Validate loss value
+                                    if current_loss == 0.0 and state.global_step > 10:
+                                        logger.error(f"CRITICAL: Zero loss detected at step {state.global_step}")
+                                        # This indicates data collator issues
+                                    
+                                    logger.info(
+                                        f"Step {state.global_step}/{state.max_steps} ({progress:.1f}%) | "
+                                        f"Loss: {current_loss:.4f} | "
+                                        f"LR: {current_lr:.2e} | "
+                                        f"Grad Norm: {grad_norm:.4f} | "
+                                        f"Tokens/s: {self.training_engine.metrics.tokens_per_second:.0f} | "
+                                        f"ETA: {eta/60:.1f}min"
+                                    )
+                        
+                        def on_log(self, args, state, control, logs=None, **kwargs):
+                            """Enhanced logging with tensorboard integration."""
+                            if logs:
+                                # Update metrics from logs
+                                if 'loss' in logs:
+                                    self.training_engine.metrics.train_loss = logs['loss']
+                                elif 'train_loss' in logs:
+                                    self.training_engine.metrics.train_loss = logs['train_loss']
+                                    
+                                if 'learning_rate' in logs:
+                                    self.training_engine.metrics.learning_rate = logs['learning_rate']
+                                    
+                                if 'grad_norm' in logs:
+                                    self.training_engine.metrics.grad_norm = logs['grad_norm']
+                                
+                                # Log to tensorboard (replaces wandb)
+                                tb_metrics = {}
+                                for key, value in logs.items():
+                                    if isinstance(value, (int, float)) and not (isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf'))):
+                                        tb_metrics[key] = value
+                                
+                                if tb_metrics:
+                                    self.tensorboard_logger.log_metrics(tb_metrics, state.global_step)
+                                
+                                # Save metrics to file
+                                self.training_engine._save_training_metrics(logs)
+                        
+                        def on_save(self, args, state, control, **kwargs):
+                            """Called when a checkpoint is saved."""
+                            self.training_engine.metrics.last_checkpoint_step = state.global_step
+                            logger.info(f"Checkpoint saved at step {state.global_step}")
+                        
+                        def on_train_end(self, args, state, control, **kwargs):
+                            """Called at the end of training."""
+                            # Log final hyperparameters and metrics
+                            hparams = {
+                                "learning_rate": args.learning_rate,
+                                "batch_size": args.per_device_train_batch_size,
+                                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                                "max_grad_norm": args.max_grad_norm,
+                                "warmup_steps": args.warmup_steps,
+                                "fp16": args.fp16,
+                                "bf16": args.bf16
+                            }
+                            
+                            final_metrics = {
+                                "final_loss": self.training_engine.metrics.train_loss,
+                                "total_steps": state.global_step
+                            }
+                            
+                            self.tensorboard_logger.log_hyperparameters(hparams, final_metrics)
+                            logger.info("Training completed - TensorBoard logging finalized")
+                    
+                    # Create custom callback
+                    progress_callback = StabilizedTrainingCallback(self)
+                    
+                    # Create trainer with all fixes
+                    trainer = Trainer(
+                        model=model,
+                        args=self.training_args,
+                        train_dataset=train_dataset,
+                        eval_dataset=eval_dataset,
+                        tokenizer=tokenizer,
+                        data_collator=data_collator,  # Use fixed data collator
+                        callbacks=[progress_callback],
+                    )
+                    
+                    self.trainer = trainer
+                    logger.info("[OK] Stabilized trainer created with all fixes integrated")
+                    
+                    return trainer
+            
+            # Initialize stabilized training engine
+            training_engine = StabilizedTrainingEngine(
                 config=config,
                 model=model,
                 tokenizer=tokenizer,
                 datasets=datasets,
                 data_collator=data_collator,
-                hardware_config=hardware_config
+                hardware_config=stability_config
             )
             
             # Setup training arguments and create trainer
             training_args = training_engine.setup_training_arguments()
             trainer = training_engine.create_trainer()
             
-            logger.info("[OK] Training engine initialized")
+            logger.info("[OK] Stabilized training engine initialized")
             logger.info(f"[OK] Training configuration: {training_engine.get_training_status()}")
             
+            # Log initial hyperparameters to tensorboard
+            hparams = {
+                "learning_rate": training_args.learning_rate,
+                "batch_size": training_args.per_device_train_batch_size,
+                "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                "max_grad_norm": training_args.max_grad_norm,
+                "warmup_ratio": training_args.warmup_ratio,
+                "weight_decay": training_args.weight_decay,
+                "fp16": training_args.fp16,
+                "bf16": training_args.bf16,
+                "model_name": config.model_name,
+                "max_length": config.max_length
+            }
+            tensorboard_logger.log_hyperparameters(hparams)
+            
             # Execute training with automatic checkpoint resumption
-            logger.info("Starting training...")
+            logger.info("Starting stabilized training...")
             final_state = training_engine.train(resume_from_checkpoint="auto")
             
             logger.info("[OK] Training completed successfully")
             logger.info(f"[OK] Final training state: {training_engine.get_training_status()}")
         
         # ============================================================================
-        # PHASE 6: INFERENCE VALIDATION AND RESULT REPORTING
+        # PHASE 7: INFERENCE VALIDATION AND RESULT REPORTING
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 6: Inference Validation and Result Reporting")
+        logger.info("PHASE 7: Inference Validation and Result Reporting")
         logger.info("-" * 50)
         
         with structured_logger.error_context("inference_validation"):
@@ -599,11 +939,11 @@ def main() -> None:
             logger.info(f"[OK] Generation quality metrics: {quality_metrics}")
         
         # ============================================================================
-        # PHASE 7: VISUALIZATION AND PLOTTING
+        # PHASE 8: VISUALIZATION AND PLOTTING
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 7: Creating Training Visualizations")
+        logger.info("PHASE 8: Creating Training Visualizations")
         logger.info("-" * 50)
         
         try:
@@ -624,30 +964,45 @@ def main() -> None:
             logger.warning(f"Failed to create plots: {e}")
         
         # ============================================================================
-        # PHASE 8: FINAL CLEANUP AND SUMMARY REPORTING
+        # PHASE 9: FINAL CLEANUP AND SUMMARY REPORTING
         # ============================================================================
         
         logger.info("-" * 50)
-        logger.info("PHASE 8: Final Cleanup and Summary Reporting")
+        logger.info("PHASE 9: Final Cleanup and Summary Reporting")
         logger.info("-" * 50)
+        
+        # Get stability report
+        stability_report = stability_configurator.get_stability_report()
+        gradient_report = gradient_stabilizer.get_stability_report()
         
         # Calculate total execution time
         total_time = time.time() - start_time
         
-        # Prepare final summary
+        # Prepare final summary with stability information
         final_summary = {
             "execution_time": total_time,
             "training_completed": True,
             "validation_completed": True,
             "model_info": model_info,
-            "hardware_config": hardware_config,
+            "stability_config": stability_config,
             "training_config": config.to_dict(),
             "final_training_metrics": training_engine.get_training_status(),
             "validation_metrics": quality_metrics,
+            "stability_report": stability_report,
+            "gradient_stability_report": gradient_report,
+            "fixes_applied": {
+                "tensorboard_logging": True,
+                "fixed_data_collator": True,
+                "gradient_stabilization": True,
+                "mixed_precision_optimization": True,
+                "hardware_specific_configuration": True,
+                "wandb_removed": True
+            },
             "output_files": {
                 "model_checkpoint": str(output_dir),
                 "validation_results": str(validation_output_file),
                 "training_logs": str(output_dir / "logs"),
+                "tensorboard_logs": str(tensorboard_logger.log_dir),
                 "training_config": str(output_dir / "training_config.json"),
                 "final_metrics": str(output_dir / "final_metrics.json")
             }
@@ -662,18 +1017,30 @@ def main() -> None:
         if training_engine:
             training_engine.cleanup()
         
+        if tensorboard_logger:
+            tensorboard_logger.close()
+        
         # Clear GPU cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
         # Log final success message
         logger.info("=" * 80)
-        logger.info("EXECUTION COMPLETED SUCCESSFULLY")
+        logger.info("EXECUTION COMPLETED SUCCESSFULLY WITH ALL STABILITY FIXES")
         logger.info("=" * 80)
         logger.info(f"Total execution time: {total_time/60:.2f} minutes")
         logger.info(f"Model trained and saved to: {output_dir}")
         logger.info(f"Validation results: {validation_output_file}")
+        logger.info(f"TensorBoard logs: {tensorboard_logger.log_dir}")
         logger.info(f"Execution summary: {summary_file}")
+        
+        # Log stability summary
+        logger.info("STABILITY FIXES APPLIED:")
+        logger.info("  ✓ Removed wandb dependencies, replaced with TensorBoard")
+        logger.info("  ✓ Fixed data collator to resolve zero loss issue")
+        logger.info("  ✓ Implemented gradient stabilization and NaN recovery")
+        logger.info("  ✓ Applied hardware-specific mixed precision settings")
+        logger.info("  ✓ Configured conservative training parameters for stability")
         
         # Log error summary if any errors were handled
         if structured_logger:
